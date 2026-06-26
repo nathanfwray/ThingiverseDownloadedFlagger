@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Thingiverse Downloaded Flagger
 // @namespace    https://github.com/nathanfwray/ThingiverseDownloadedFlagger
-// @version      0.3.0
-// @description  Flags Thingiverse things you've already downloaded by matching thing IDs against a local folder (File System Access API). Scans in a Web Worker so the page never freezes.
+// @version      0.4.0
+// @description  Flags Thingiverse things you've already downloaded by matching thing IDs against a local folder (File System Access API). Web Worker scan, change reporting, and optional auto-rescan.
 // @author       Nate
 // @match        https://www.thingiverse.com/*
 // @run-at       document-idle
@@ -35,6 +35,8 @@
     matchFolderNames: false,
     badgeText: 'DOWNLOADED',
     scanConcurrency: 8,
+    autoRescan: 'off',    // 'off' | 'focus' | 'interval'
+    autoRescanHours: 6,   // cooldown window for 'interval' (and gate for 'focus')
   };
 
   // In-memory state for the current page.
@@ -306,14 +308,23 @@
     }
   }
 
-  async function runScan(onProgress) {
+  // opts.silent: auto-rescan path — never alert(), never prompt for permission
+  // (no user gesture available). A non-granted handle just no-ops.
+  async function runScan(onProgress, opts) {
+    const silent = !!(opts && opts.silent);
     if (state.scanning) return { aborted: true };
     state.scanning = true;
     try {
       const handle = await getStoredHandle();
-      if (!handle) { alert('Choose a folder first.'); return { aborted: true }; }
-      const status = await checkPermission(handle, true);
-      if (status !== 'granted') { alert('Folder permission was not granted.'); return { aborted: true }; }
+      if (!handle) { if (!silent) alert('Choose a folder first.'); return { aborted: true }; }
+      const status = await checkPermission(handle, !silent);
+      if (status !== 'granted') {
+        if (!silent) alert('Folder permission was not granted.');
+        return { aborted: true };
+      }
+
+      // Snapshot the prior manifest before we overwrite it, for change reporting.
+      const prevManifest = await idbGet(STORE_MANIFEST, MANIFEST_KEY);
 
       const result = await scanInWorker(handle, state.settings, onProgress);
       if (result.aborted) return result; // cancelled — keep the previous index
@@ -325,11 +336,48 @@
 
       state.ids = result.ids;
       state.indexMeta = { builtAt, fileCount: result.fileCount };
+      result.diff = diffManifests(prevManifest, { entries: result.manifest });
       decoratePage(); // refresh badges with new data
       return result;
     } finally {
       state.scanning = false;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Incremental change reporting (phase 6)
+  // ---------------------------------------------------------------------------
+  // Diff is computed over the names-only manifest. Thing-level add/remove is a
+  // set-difference of the IDs each manifest yields, so an ID counts as "removed"
+  // only when NO remaining file still produces it — i.e. ref counting falls out
+  // of the set diff for free, no separate refcount store needed.
+  function idsOfManifest(entries) {
+    const s = new Set();
+    for (const e of (entries || [])) {
+      for (const id of (e.i || [])) s.add(id);
+    }
+    return s;
+  }
+
+  function diffManifests(prev, next) {
+    const prevEntries = (prev && prev.entries) || [];
+    const nextEntries = (next && next.entries) || [];
+    const prevPaths = new Set(prevEntries.map((e) => e.p));
+    const nextPaths = new Set(nextEntries.map((e) => e.p));
+    let filesAdded = 0, filesRemoved = 0;
+    for (const p of nextPaths) if (!prevPaths.has(p)) filesAdded++;
+    for (const p of prevPaths) if (!nextPaths.has(p)) filesRemoved++;
+
+    const prevIds = idsOfManifest(prevEntries);
+    const nextIds = idsOfManifest(nextEntries);
+    let thingsAdded = 0, thingsRemoved = 0;
+    for (const id of nextIds) if (!prevIds.has(id)) thingsAdded++;
+    for (const id of prevIds) if (!nextIds.has(id)) thingsRemoved++;
+
+    return {
+      hadPrevious: !!(prev && prev.entries),
+      filesAdded, filesRemoved, thingsAdded, thingsRemoved,
+    };
   }
 
   async function hydrateIndex() {
@@ -338,6 +386,45 @@
       state.ids = new Set(record.ids);
       state.indexMeta = { builtAt: record.builtAt, fileCount: record.fileCount };
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto-rescan policy (phase 6)
+  // ---------------------------------------------------------------------------
+  // FSA exposes no folder-watch and no directory mtimes, so we can't react to
+  // disk changes. Instead we rescan on a chosen trigger, gated by a cooldown so
+  // it never runs on consecutive page loads. Auto-rescans are silent: they never
+  // prompt for permission, so a session that hasn't been reconnected just keeps
+  // using the cached index until the user clicks "Reconnect folder".
+  function autoRescanCooldownElapsed() {
+    const last = state.indexMeta && state.indexMeta.builtAt;
+    if (!last) return true; // never scanned → allow
+    const hours = Math.max(1 / 60, Number(state.settings.autoRescanHours) || 6);
+    return (Date.now() - last) >= hours * 3600 * 1000;
+  }
+
+  async function autoRescanTick(trigger) {
+    const mode = state.settings.autoRescan;
+    if (mode === 'off' || mode !== trigger) return; // trigger must match the chosen mode
+    if (state.scanning || !autoRescanCooldownElapsed()) return;
+    try {
+      const result = await runScan(null, { silent: true });
+      if (result && !result.aborted && result.diff) {
+        const d = result.diff;
+        if (d.thingsAdded || d.thingsRemoved) {
+          console.info(`[TDF] auto-rescan: +${d.thingsAdded} new, -${d.thingsRemoved} gone`);
+        }
+      }
+    } catch (e) {
+      console.warn('[TDF] auto-rescan failed', e);
+    }
+  }
+
+  function startAutoRescan() {
+    // 'focus' mode: rescan when the tab regains focus (cooldown-gated).
+    window.addEventListener('focus', () => autoRescanTick('focus'));
+    // 'interval' mode: poll every few minutes; the cooldown decides if it runs.
+    setInterval(() => autoRescanTick('interval'), 5 * 60 * 1000);
   }
 
   // ---------------------------------------------------------------------------
@@ -513,6 +600,18 @@
       <label style="display:block;margin-bottom:4px;">Badge text</label>
       <input id="${NS}-badge" value="${escapeHtml(s.badgeText)}"
              style="width:100%;box-sizing:border-box;margin-bottom:12px;"/>
+      <label style="display:block;margin-bottom:4px;">Automatic rescan</label>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;">
+        <select id="${NS}-auto">
+          <option value="off">Off</option>
+          <option value="focus">When the tab regains focus</option>
+          <option value="interval">Every N hours</option>
+        </select>
+        <span id="${NS}-auto-hours-wrap">
+          <input id="${NS}-auto-hours" type="number" min="1" step="1"
+                 style="width:64px;box-sizing:border-box;"/> hours
+        </span>
+      </div>
       <div id="${NS}-status" style="color:#555;margin-bottom:12px;">${escapeHtml(metaLine)}</div>
       <div style="display:flex;gap:8px;justify-content:flex-end;">
         <button id="${NS}-rescan" type="button">Rescan now</button>
@@ -544,6 +643,16 @@
       renderPermission(await checkPermission(h, false));
     }
     refreshFolderStatus();
+
+    // Auto-rescan controls: reflect current settings, hide the hours box unless
+    // the interval mode is selected.
+    $('auto').value = s.autoRescan;
+    $('auto-hours').value = s.autoRescanHours;
+    const syncAutoUI = () => {
+      $('auto-hours-wrap').style.display = ($('auto').value === 'interval') ? '' : 'none';
+    };
+    $('auto').addEventListener('change', syncAutoUI);
+    syncAutoUI();
 
     // Live regex tester.
     const runTest = () => {
@@ -607,8 +716,12 @@
         return;
       }
       const m = state.indexMeta;
+      const d = result && result.diff;
+      const change = (d && d.hadPrevious && (d.thingsAdded || d.thingsRemoved))
+        ? ` · +${d.thingsAdded} new, -${d.thingsRemoved} gone`
+        : '';
       status.textContent = m
-        ? `Done: ${m.fileCount} files, ${state.ids.size} IDs (${new Date(m.builtAt).toLocaleString()})`
+        ? `Done: ${m.fileCount} files, ${state.ids.size} IDs (${new Date(m.builtAt).toLocaleString()})${change}`
         : 'Scan finished.';
     });
 
@@ -633,6 +746,8 @@
     state.settings.filenamePattern = $('pattern').value || DEFAULT_SETTINGS.filenamePattern;
     state.settings.matchFolderNames = $('folders').checked;
     state.settings.badgeText = $('badge').value || DEFAULT_SETTINGS.badgeText;
+    state.settings.autoRescan = $('auto').value;
+    state.settings.autoRescanHours = Math.max(1, parseInt($('auto-hours').value, 10) || DEFAULT_SETTINGS.autoRescanHours);
     saveSettings();
   }
 
@@ -652,5 +767,6 @@
     decoratePage();            // flag what's already on the page
     startObserver();           // catch lazy-loaded cards
     watchNavigation();         // re-run on soft navigations
+    startAutoRescan();         // optional, cooldown-gated background refresh
   })();
 })();

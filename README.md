@@ -10,9 +10,11 @@ No companion app, no server, no uploads. The script reads your local folder
 directly through the browser's [File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API),
 and only ever reads file **names** — it never opens file contents.
 
-**Current version: 0.3.0** — the folder scan now runs in a Web Worker, so
-indexing a large library no longer freezes the page, and a scan can be cancelled
-mid-run from the settings panel (your previous index is kept).
+**Current version: 0.4.0** — the folder scan runs in a Web Worker (indexing a
+large library never freezes the page, and a scan can be cancelled mid-run with
+the previous index kept). Rescans now report what changed (e.g. *+12 new, -3
+gone*), and an optional **automatic rescan** can refresh the index when the tab
+regains focus or on an interval.
 
 ## How it works
 
@@ -81,10 +83,27 @@ things. To refresh it after adding (or removing) files:
 
 1. Open **Tampermonkey menu → "Thingiverse Downloads — Settings"**.
 2. Click **Rescan now**. The script re-walks the same folder you already picked
-   and rebuilds the ID index. No need to re-select the folder.
+   and rebuilds the ID index. No need to re-select the folder. When it finishes,
+   the status line reports what changed since the last scan (e.g. *+12 new, -3
+   gone*).
 
 You only need to choose a folder again if you want to point at a **different**
 folder, or if you moved/renamed the original one.
+
+#### Automatic rescan (optional)
+
+To avoid clicking *Rescan now* by hand, set **Automatic rescan** in the settings
+panel to either:
+
+- **When the tab regains focus** — re-indexes when you switch back to a
+  Thingiverse tab, or
+- **Every N hours** — re-indexes on an interval.
+
+Both are gated by a cooldown (the **hours** value) so a rescan never runs on
+consecutive page loads — at most once per window. Automatic rescans are silent
+and never pop a permission prompt, so if the session shows **"Needs reconnect"**
+they're skipped until you reconnect the folder once (below); the cached index
+keeps working in the meantime.
 
 ### "Needs reconnect" after restarting the browser
 
@@ -103,7 +122,8 @@ stale).
 | **Filename ID pattern** | Regex used to pull the thing ID from each file name. Capture group 1 is the ID. Includes a live tester. |
 | **Also match IDs in folder names** | Extract IDs from directory names too, not just files. |
 | **Badge text** | The label shown on flagged things (default `DOWNLOADED`). |
-| **Rescan now** | Re-walk the chosen folder and rebuild the index. |
+| **Automatic rescan** | Off, on tab focus, or every N hours — cooldown-gated, silent, and skipped until the folder is reconnected. |
+| **Rescan now** | Re-walk the chosen folder, rebuild the index, and report what changed since the last scan. |
 
 ## Privacy
 
