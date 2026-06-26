@@ -13,15 +13,16 @@ each `README.txt` (the small text file Thingiverse bundles with every download)
 to read the thing ID, because that's where the standard download layout keeps
 it. Nothing leaves your machine either way.
 
-**Current version: 0.6.0** — IDs are matched both from file names **and from the
+**Current version: 0.7.0** — IDs are matched both from file names **and from the
 `thingiverse.com/thing:<id>` URL inside `README.txt`**, so a normal Thingiverse
 download library (folders/files named by title, ID only in the README) flags
 correctly. The folder scan runs in a Web Worker (indexing a large library never
 freezes the page, and a scan can be cancelled mid-run with the previous index
-kept). Rescans report what changed (e.g. *+12 new, -3 gone*), an optional
-**automatic rescan** can refresh the index when the tab regains focus or on an
-interval, and the **badge color and corner** are customizable with a live
-preview.
+kept). Rescans report what changed (e.g. *+12 new, -3 gone*), and after any scan
+**every open Thingiverse tab updates its badges live** — no manual reload. An
+optional **automatic rescan** can refresh the index when the tab regains focus
+or on an interval, and the **badge color and corner** are customizable with a
+live preview.
 
 ## How it works
 

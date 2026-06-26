@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Thingiverse Downloaded Flagger
 // @namespace    https://github.com/nathanfwray/ThingiverseDownloadedFlagger
-// @version      0.6.0
-// @description  Flags Thingiverse things you've already downloaded by matching thing IDs in a local folder (File System Access API) — from file names and from the thing URL inside README.txt. Web Worker scan, change reporting, optional auto-rescan, customizable badges.
+// @version      0.7.0
+// @description  Flags Thingiverse things you've already downloaded by matching thing IDs in a local folder (File System Access API) — from file names and from the thing URL inside README.txt. Web Worker scan, change reporting, optional auto-rescan, customizable badges, live cross-tab index updates.
 // @author       Nate
 // @match        https://www.thingiverse.com/*
 // @run-at       document-idle
@@ -33,6 +33,12 @@
   // not in the file names. These drive the opt-in README content scan.
   const README_NAME = 'README.txt';                       // matched case-insensitively
   const README_PATTERN = 'thingiverse\\.com/thing:(\\d+)'; // capture group 1 = thing ID
+
+  // Cross-tab live updates: when one tab finishes a scan, every other open
+  // Thingiverse tab re-hydrates from IndexedDB without a manual reload.
+  const indexChannel = (() => {
+    try { return new BroadcastChannel('tdf-index'); } catch (e) { return null; }
+  })();
 
   const DEFAULT_SETTINGS = {
     enabled: true,
@@ -369,6 +375,9 @@
       state.indexMeta = { builtAt, fileCount: result.fileCount };
       result.diff = diffManifests(prevManifest, { entries: result.manifest });
       decoratePage(); // refresh badges with new data
+      // Tell other open tabs to pick up the new index (this tab won't hear its
+      // own message — BroadcastChannel never echoes to the sender).
+      if (indexChannel) indexChannel.postMessage({ type: 'index-updated', builtAt });
       return result;
     } finally {
       state.scanning = false;
@@ -456,6 +465,43 @@
     window.addEventListener('focus', () => autoRescanTick('focus'));
     // 'interval' mode: poll every few minutes; the cooldown decides if it runs.
     setInterval(() => autoRescanTick('interval'), 5 * 60 * 1000);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cross-tab index sync — pick up another tab's scan without a manual reload
+  // ---------------------------------------------------------------------------
+  // Wipe existing badges + checked marks so a re-decoration reflects the new id
+  // set exactly: newly-downloaded things gain a badge, removed ones lose theirs.
+  function clearDecorations() {
+    document.querySelectorAll(`.${NS}-badge, .${NS}-card-badge`).forEach((n) => n.remove());
+    document.querySelectorAll(`[${CHECKED_ATTR}]`).forEach((n) => n.removeAttribute(CHECKED_ATTR));
+  }
+
+  function redecorate() {
+    clearDecorations();
+    decoratePage();
+  }
+
+  // Re-read the index; only repaint if it actually changed (avoids flicker).
+  async function rehydrateIfChanged() {
+    if (state.scanning) return; // our own scan updates state + repaints already
+    const prev = state.indexMeta && state.indexMeta.builtAt;
+    await hydrateIndex();
+    const now = state.indexMeta && state.indexMeta.builtAt;
+    if (now !== prev) redecorate();
+  }
+
+  function startIndexSync() {
+    if (indexChannel) {
+      indexChannel.onmessage = (e) => {
+        if (e && e.data && e.data.type === 'index-updated') rehydrateIfChanged();
+      };
+    }
+    // Fallback for backgrounded tabs / browsers without BroadcastChannel.
+    window.addEventListener('focus', rehydrateIfChanged);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) rehydrateIfChanged();
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -878,5 +924,6 @@
     startObserver();           // catch lazy-loaded cards
     watchNavigation();         // re-run on soft navigations
     startAutoRescan();         // optional, cooldown-gated background refresh
+    startIndexSync();          // live-update when another tab finishes a scan
   })();
 })();
