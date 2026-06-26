@@ -7,32 +7,42 @@ file in a local folder you pick gets a small **DOWNLOADED** badge — on the thi
 page itself and on every card in listing, search, collection, and maker pages.
 
 No companion app, no server, no uploads. The script reads your local folder
-directly through the browser's [File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API),
-and only ever reads file **names** — it never opens file contents.
+directly through the browser's [File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API).
+For speed it reads file **names** only — with one deliberate exception: it opens
+each `README.txt` (the small text file Thingiverse bundles with every download)
+to read the thing ID, because that's where the standard download layout keeps
+it. Nothing leaves your machine either way.
 
-**Current version: 0.5.0** — the folder scan runs in a Web Worker (indexing a
-large library never freezes the page, and a scan can be cancelled mid-run with
-the previous index kept). Rescans report what changed (e.g. *+12 new, -3 gone*),
-an optional **automatic rescan** can refresh the index when the tab regains
-focus or on an interval, and the **badge color and corner** are customizable
-with a live preview.
+**Current version: 0.6.0** — IDs are matched both from file names **and from the
+`thingiverse.com/thing:<id>` URL inside `README.txt`**, so a normal Thingiverse
+download library (folders/files named by title, ID only in the README) flags
+correctly. The folder scan runs in a Web Worker (indexing a large library never
+freezes the page, and a scan can be cancelled mid-run with the previous index
+kept). Rescans report what changed (e.g. *+12 new, -3 gone*), an optional
+**automatic rescan** can refresh the index when the tab regains focus or on an
+interval, and the **badge color and corner** are customizable with a live
+preview.
 
 ## How it works
 
 The design rests on one idea: **scan rarely, look up constantly.**
 
 1. **Scan (once, on demand):** you point the script at a single root folder. It
-   walks that folder and its subfolders, pulls the Thingiverse thing ID out of
-   each file name (e.g. `Articulated_Dragon_-_4734271.zip` → `4734271`), and
-   stores the resulting set of IDs in the browser's IndexedDB.
+   walks that folder and its subfolders and collects Thingiverse thing IDs two
+   ways, then stores the resulting set in the browser's IndexedDB:
+   - from **file names** that contain an ID (e.g. `Articulated_Dragon_-_4734271.zip` → `4734271`), and
+   - from the **`thingiverse.com/thing:<id>` URL inside each `README.txt`** — the
+     standard Thingiverse download names its folder/files by *title*, so the ID
+     survives only in that bundled README. (Toggleable; on by default.)
 2. **Look up (every page):** on each Thingiverse page the script loads that ID
    set into memory and checks the `/thing:<id>` links on the page. Matches get a
    badge. Page loads never touch the disk, so browsing stays fast even with tens
    of thousands of indexed files.
 
-Because the ID lives in the file name, the folder walk reads directory entry
-names only and never materializes file objects — the slow part of filesystem
-access is skipped entirely.
+The walk reads directory entry **names** only — the fast path — and never
+materializes file objects, *except* for `README.txt` files, which are small and
+get opened to recover the ID. That keeps the dominant cost (name enumeration)
+cheap while still matching a real download library.
 
 ## Requirements
 
@@ -40,8 +50,9 @@ access is skipped entirely.
   API and `showDirectoryPicker()` are required; Firefox/Safari do not currently
   support them.
 - The [Tampermonkey](https://www.tampermonkey.net/) browser extension.
-- Your downloaded Thingiverse files in **one root folder** (subfolders are fine),
-  with the thing ID present in each file's name.
+- Your downloaded Thingiverse files in **one root folder** (subfolders are fine).
+  The thing ID is found in each download's bundled `README.txt`, and/or in file
+  names that contain the ID — either works.
 
 ## Install / Enable
 
@@ -122,6 +133,7 @@ stale).
 | **Choose folder / Reconnect folder** | Select the root download folder / re-grant read access for the session. |
 | **Filename ID pattern** | Regex used to pull the thing ID from each file name. Capture group 1 is the ID. Includes a live tester. |
 | **Also match IDs in folder names** | Extract IDs from directory names too, not just files. |
+| **Read thing ID from README.txt** | Open each `README.txt` and extract the `thingiverse.com/thing:<id>` URL — needed for standard title-named downloads. On by default. |
 | **Badge text** | The label shown on flagged things (default `DOWNLOADED`). |
 | **Badge color / corner** | Badge background color (picker or any CSS color) and which corner of a card it sits in, with a live preview. |
 | **Automatic rescan** | Off, on tab focus, or every N hours — cooldown-gated, silent, and skipped until the folder is reconnected. |
@@ -130,8 +142,9 @@ stale).
 ## Privacy
 
 All processing happens locally in your browser. The folder you pick is accessed
-through the browser's permission-gated File System Access API, only file/folder
-**names** are read, and nothing is ever sent off your machine.
+through the browser's permission-gated File System Access API. Only file/folder
+**names** are read, plus the contents of `README.txt` files (to recover the
+thing ID) when that option is enabled. Nothing is ever sent off your machine.
 
 ## Project plan
 

@@ -9,9 +9,16 @@ already downloaded, by matching the thing's ID against a single local folder
 - **Local file access:** File System Access API (FSA). The user grants one root
   folder via `showDirectoryPicker()`; the directory handle is persisted in
   IndexedDB and reused. No companion app or server.
-- **ID source:** the Thingiverse thing ID appears in **file names** (e.g.
-  `Articulated_Dragon_-_4734271.zip`, `4734271.stl`). Matching reads directory
-  entry names only — it never opens file contents.
+- **ID source:** the Thingiverse thing ID can appear in **file names** (e.g.
+  `Articulated_Dragon_-_4734271.zip`, `4734271.stl`) — matched by reading
+  directory entry names only.
+  - **Revised in v0.6.0:** the *standard* Thingiverse download names its folder
+    and files by **title**, so the ID is not in any name; it survives only in the
+    bundled `README.txt` (`... on Thingiverse: https://www.thingiverse.com/thing:<id>`).
+    The scanner therefore also opens `README.txt` files (opt-in, on by default)
+    and extracts the ID from that URL. This is a deliberate exception to the
+    original "never opens file contents" rule — bounded to README.txt, which is
+    tiny and ~one per download, so the names-only fast path still dominates.
 
 ---
 

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Thingiverse Downloaded Flagger
 // @namespace    https://github.com/nathanfwray/ThingiverseDownloadedFlagger
-// @version      0.5.0
-// @description  Flags Thingiverse things you've already downloaded by matching thing IDs against a local folder (File System Access API). Web Worker scan, change reporting, optional auto-rescan, and customizable badges.
+// @version      0.6.0
+// @description  Flags Thingiverse things you've already downloaded by matching thing IDs in a local folder (File System Access API) — from file names and from the thing URL inside README.txt. Web Worker scan, change reporting, optional auto-rescan, customizable badges.
 // @author       Nate
 // @match        https://www.thingiverse.com/*
 // @run-at       document-idle
@@ -28,11 +28,18 @@
   const INDEX_KEY = 'main';
   const MANIFEST_KEY = 'main';
 
+  // Standard Thingiverse downloads keep the thing ID only inside README.txt
+  // (e.g. "... on Thingiverse: https://www.thingiverse.com/thing:4570091"),
+  // not in the file names. These drive the opt-in README content scan.
+  const README_NAME = 'README.txt';                       // matched case-insensitively
+  const README_PATTERN = 'thingiverse\\.com/thing:(\\d+)'; // capture group 1 = thing ID
+
   const DEFAULT_SETTINGS = {
     enabled: true,
     // Numeric ID, 5-9 digits, optionally prefixed by thing / : / _ / -
     filenamePattern: '(?:thing[:_-]?)?(\\d{5,9})',
     matchFolderNames: false,
+    scanReadme: true,     // open README.txt files and read the thing: URL inside
     badgeText: 'DOWNLOADED',
     badgeColor: '#1e88e5',
     badgeCorner: 'tl',    // card-badge corner: 'tl' | 'tr' | 'bl' | 'br'
@@ -148,8 +155,11 @@
   // The recursive walk runs in a Blob-URL Worker so a large tree never freezes
   // the page the user is browsing. The directory handle is structured-cloned
   // into the worker; read permission is granted on the MAIN thread first
-  // (requestPermission needs a user gesture and is main-thread only). The worker
-  // reads entry.name only — it never calls getFile().
+  // (requestPermission needs a user gesture and is main-thread only).
+  // Fast path: most entries are read by NAME only (no getFile()). The one
+  // exception is README.txt — standard Thingiverse downloads store the thing ID
+  // only inside it — so when scanReadme is on we open just those small files and
+  // pull the ID from the thingiverse.com/thing:<id> URL.
   const WORKER_SRC = `
     'use strict';
     let aborted = false;
@@ -181,8 +191,10 @@
 
     async function run(rootHandle, settings) {
       const re = buildRegex(settings.filenamePattern, settings.fallbackPattern);
+      const readmeRe = settings.scanReadme ? new RegExp(settings.readmePattern, 'gi') : null;
+      const readmeName = (settings.readmeName || '').toLowerCase();
       const ids = new Set();
-      const manifest = [];           // [{ p: path, i: [ids] }] — names only, for phase 6
+      const manifest = [];           // [{ p: path, i: [ids] }]
       let fileCount = 0;
 
       const limit = Math.max(1, settings.scanConcurrency | 0);
@@ -197,6 +209,19 @@
             fileCount++;
             const found = [];
             extractIds(entry.name, re, found);
+            // Standard Thingiverse layout: ID lives inside README.txt, not the
+            // file names. Open just those (small) files to recover it.
+            if (readmeRe && entry.name.toLowerCase() === readmeName) {
+              try {
+                const text = await (await entry.getFile()).text();
+                readmeRe.lastIndex = 0;
+                let rm;
+                while ((rm = readmeRe.exec(text)) !== null) {
+                  if (rm[1]) found.push(rm[1]);
+                  if (rm.index === readmeRe.lastIndex) readmeRe.lastIndex++;
+                }
+              } catch (e) { /* unreadable README — skip, don't fail the scan */ }
+            }
             if (found.length) {
               for (const id of found) ids.add(id);
               manifest.push({ p: path, i: found });
@@ -296,6 +321,9 @@
           fallbackPattern: DEFAULT_SETTINGS.filenamePattern,
           matchFolderNames: settings.matchFolderNames,
           scanConcurrency: settings.scanConcurrency,
+          scanReadme: settings.scanReadme,
+          readmeName: README_NAME,
+          readmePattern: README_PATTERN,
         },
       });
     });
@@ -625,6 +653,10 @@
         <input type="checkbox" id="${NS}-folders" ${s.matchFolderNames ? 'checked' : ''}/>
         Also match IDs in folder names
       </label>
+      <label style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
+        <input type="checkbox" id="${NS}-readme" ${s.scanReadme ? 'checked' : ''}/>
+        Read thing ID from README.txt (Thingiverse downloads)
+      </label>
       <label style="display:block;margin-bottom:4px;">Badge text</label>
       <input id="${NS}-badge" value="${escapeHtml(s.badgeText)}"
              style="width:100%;box-sizing:border-box;margin-bottom:8px;"/>
@@ -820,6 +852,7 @@
     state.settings.enabled = $('enabled').checked;
     state.settings.filenamePattern = $('pattern').value || DEFAULT_SETTINGS.filenamePattern;
     state.settings.matchFolderNames = $('folders').checked;
+    state.settings.scanReadme = $('readme').checked;
     state.settings.badgeText = $('badge').value || DEFAULT_SETTINGS.badgeText;
     state.settings.badgeColor = safeColor($('badge-color-text').value);
     state.settings.badgeCorner = $('badge-corner').value;
