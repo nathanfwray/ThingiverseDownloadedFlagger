@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Thingiverse Downloaded Flagger
 // @namespace    https://github.com/nathanfwray/ThingiverseDownloadedFlagger
-// @version      0.4.0
-// @description  Flags Thingiverse things you've already downloaded by matching thing IDs against a local folder (File System Access API). Web Worker scan, change reporting, and optional auto-rescan.
+// @version      0.5.0
+// @description  Flags Thingiverse things you've already downloaded by matching thing IDs against a local folder (File System Access API). Web Worker scan, change reporting, optional auto-rescan, and customizable badges.
 // @author       Nate
 // @match        https://www.thingiverse.com/*
 // @run-at       document-idle
@@ -34,6 +34,8 @@
     filenamePattern: '(?:thing[:_-]?)?(\\d{5,9})',
     matchFolderNames: false,
     badgeText: 'DOWNLOADED',
+    badgeColor: '#1e88e5',
+    badgeCorner: 'tl',    // card-badge corner: 'tl' | 'tr' | 'bl' | 'br'
     scanConcurrency: 8,
     autoRescan: 'off',    // 'off' | 'focus' | 'interval'
     autoRescanHours: 6,   // cooldown window for 'interval' (and gate for 'focus')
@@ -157,7 +159,8 @@
       if (msg.type === 'abort') { aborted = true; return; }
       if (msg.type === 'start') {
         run(msg.rootHandle, msg.settings).catch((err) => {
-          self.postMessage({ type: 'error', message: String((err && err.message) || err) });
+          const name = (err && err.name) ? err.name + ': ' : '';
+          self.postMessage({ type: 'error', message: name + String((err && err.message) || err) });
         });
       }
     };
@@ -433,12 +436,30 @@
   const THING_HREF_RE = /\/thing:(\d+)/;
   const CHECKED_ATTR = `data-${NS}-checked`;
 
-  function injectStyles() {
-    if (document.getElementById(`${NS}-styles`)) return;
-    const css = `
+  // Defuse anything that could break out of a CSS value (it's the user's own
+  // setting, but a stray ; or } would corrupt the whole stylesheet).
+  function safeColor(c) {
+    c = String(c || '').trim();
+    if (!c || /[;{}<>()]/.test(c)) return DEFAULT_SETTINGS.badgeColor;
+    return c;
+  }
+
+  function cornerCss(corner) {
+    switch (corner) {
+      case 'tr': return 'top: 6px; right: 6px;';
+      case 'bl': return 'bottom: 6px; left: 6px;';
+      case 'br': return 'bottom: 6px; right: 6px;';
+      case 'tl':
+      default:   return 'top: 6px; left: 6px;';
+    }
+  }
+
+  function buildBadgeCss() {
+    const color = safeColor(state.settings.badgeColor);
+    return `
       .${NS}-badge {
         display: inline-block;
-        background: #1e88e5;
+        background: ${color};
         color: #fff;
         font: 700 10px/1.4 system-ui, sans-serif;
         letter-spacing: .04em;
@@ -450,9 +471,8 @@
       }
       .${NS}-card-badge {
         position: absolute;
-        top: 6px;
-        left: 6px;
-        background: #1e88e5;
+        ${cornerCss(state.settings.badgeCorner)}
+        background: ${color};
         color: #fff;
         font: 700 10px/1.4 system-ui, sans-serif;
         padding: 2px 6px;
@@ -460,10 +480,18 @@
         pointer-events: none;
         z-index: 9999;
       }`;
-    const el = document.createElement('style');
-    el.id = `${NS}-styles`;
-    el.textContent = css;
-    document.head.appendChild(el);
+  }
+
+  // Idempotent create + always refresh, so a settings change restyles every
+  // existing badge instantly (they key off the shared class).
+  function injectStyles() {
+    let el = document.getElementById(`${NS}-styles`);
+    if (!el) {
+      el = document.createElement('style');
+      el.id = `${NS}-styles`;
+      document.head.appendChild(el);
+    }
+    el.textContent = buildBadgeCss();
   }
 
   function makeBadge(cls) {
@@ -599,7 +627,22 @@
       </label>
       <label style="display:block;margin-bottom:4px;">Badge text</label>
       <input id="${NS}-badge" value="${escapeHtml(s.badgeText)}"
-             style="width:100%;box-sizing:border-box;margin-bottom:12px;"/>
+             style="width:100%;box-sizing:border-box;margin-bottom:8px;"/>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+        <span style="color:#555;">Color</span>
+        <input id="${NS}-badge-color" type="color" style="width:36px;height:26px;padding:0;border:none;background:none;"/>
+        <input id="${NS}-badge-color-text" style="width:96px;box-sizing:border-box;"/>
+        <span style="color:#555;margin-left:6px;">Corner</span>
+        <select id="${NS}-badge-corner">
+          <option value="tl">Top-left</option>
+          <option value="tr">Top-right</option>
+          <option value="bl">Bottom-left</option>
+          <option value="br">Bottom-right</option>
+        </select>
+      </div>
+      <div style="margin-bottom:12px;color:#555;">
+        Preview: <span id="${NS}-badge-preview"></span>
+      </div>
       <label style="display:block;margin-bottom:4px;">Automatic rescan</label>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;">
         <select id="${NS}-auto">
@@ -638,6 +681,7 @@
 
     // Show current folder name + current permission (query only, no prompt).
     async function refreshFolderStatus() {
+      if (!window.showDirectoryPicker) return; // unsupported-browser notice owns the perm line
       const h = await getStoredHandle();
       if (h) $('folder').textContent = h.name;
       renderPermission(await checkPermission(h, false));
@@ -653,6 +697,26 @@
     };
     $('auto').addEventListener('change', syncAutoUI);
     syncAutoUI();
+
+    // Badge styling controls + live preview. The color picker only speaks
+    // #rrggbb, so the text field is the source of truth (accepts names too).
+    $('badge-color').value = /^#[0-9a-fA-F]{6}$/.test(s.badgeColor) ? s.badgeColor : DEFAULT_SETTINGS.badgeColor;
+    $('badge-color-text').value = s.badgeColor;
+    $('badge-corner').value = s.badgeCorner;
+    const renderBadgePreview = () => {
+      const prev = $('badge-preview');
+      prev.className = `${NS}-badge`;
+      prev.textContent = $('badge').value || DEFAULT_SETTINGS.badgeText;
+      prev.style.marginLeft = '0';
+      prev.style.background = safeColor($('badge-color-text').value);
+    };
+    $('badge').addEventListener('input', renderBadgePreview);
+    $('badge-color-text').addEventListener('input', renderBadgePreview);
+    $('badge-color').addEventListener('input', () => {
+      $('badge-color-text').value = $('badge-color').value;
+      renderBadgePreview();
+    });
+    renderBadgePreview();
 
     // Live regex tester.
     const runTest = () => {
@@ -674,6 +738,14 @@
     };
     $('pattern').addEventListener('input', runTest);
     $('test').addEventListener('input', runTest);
+
+    // Hard error state: no File System Access API → folder actions can't work.
+    if (!window.showDirectoryPicker) {
+      ['pick', 'reconnect', 'rescan'].forEach((id) => { $(id).disabled = true; });
+      $('perm').textContent = 'This browser lacks the File System Access API (try Chrome/Edge).';
+      $('perm').style.color = '#c62828';
+      $('perm-dot').style.background = '#c62828';
+    }
 
     $('pick').addEventListener('click', async () => {
       try {
@@ -704,7 +776,10 @@
           status.textContent = `Scanning… ${p.fileCount} files, ${p.idCount} IDs`;
         });
       } catch (e) {
-        status.textContent = 'Scan failed: ' + ((e && e.message) || e);
+        const msg = (e && e.message) || String(e);
+        status.textContent = /not.?found|no longer|GONE/i.test(msg)
+          ? 'Folder not found — it may have been moved or renamed. Click “Choose folder…” to re-select it.'
+          : 'Scan failed: ' + msg;
         return;
       } finally {
         $('rescan').disabled = false;
@@ -746,6 +821,8 @@
     state.settings.filenamePattern = $('pattern').value || DEFAULT_SETTINGS.filenamePattern;
     state.settings.matchFolderNames = $('folders').checked;
     state.settings.badgeText = $('badge').value || DEFAULT_SETTINGS.badgeText;
+    state.settings.badgeColor = safeColor($('badge-color-text').value);
+    state.settings.badgeCorner = $('badge-corner').value;
     state.settings.autoRescan = $('auto').value;
     state.settings.autoRescanHours = Math.max(1, parseInt($('auto-hours').value, 10) || DEFAULT_SETTINGS.autoRescanHours);
     saveSettings();

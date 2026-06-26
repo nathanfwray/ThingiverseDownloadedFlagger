@@ -10,11 +10,12 @@ No companion app, no server, no uploads. The script reads your local folder
 directly through the browser's [File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API),
 and only ever reads file **names** — it never opens file contents.
 
-**Current version: 0.4.0** — the folder scan runs in a Web Worker (indexing a
+**Current version: 0.5.0** — the folder scan runs in a Web Worker (indexing a
 large library never freezes the page, and a scan can be cancelled mid-run with
-the previous index kept). Rescans now report what changed (e.g. *+12 new, -3
-gone*), and an optional **automatic rescan** can refresh the index when the tab
-regains focus or on an interval.
+the previous index kept). Rescans report what changed (e.g. *+12 new, -3 gone*),
+an optional **automatic rescan** can refresh the index when the tab regains
+focus or on an interval, and the **badge color and corner** are customizable
+with a live preview.
 
 ## How it works
 
@@ -122,6 +123,7 @@ stale).
 | **Filename ID pattern** | Regex used to pull the thing ID from each file name. Capture group 1 is the ID. Includes a live tester. |
 | **Also match IDs in folder names** | Extract IDs from directory names too, not just files. |
 | **Badge text** | The label shown on flagged things (default `DOWNLOADED`). |
+| **Badge color / corner** | Badge background color (picker or any CSS color) and which corner of a card it sits in, with a live preview. |
 | **Automatic rescan** | Off, on tab focus, or every N hours — cooldown-gated, silent, and skipped until the folder is reconnected. |
 | **Rescan now** | Re-walk the chosen folder, rebuild the index, and report what changed since the last scan. |
 
