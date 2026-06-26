@@ -10,6 +10,10 @@ No companion app, no server, no uploads. The script reads your local folder
 directly through the browser's [File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API),
 and only ever reads file **names** — it never opens file contents.
 
+**Current version: 0.3.0** — the folder scan now runs in a Web Worker, so
+indexing a large library no longer freezes the page, and a scan can be cancelled
+mid-run from the settings panel (your previous index is kept).
+
 ## How it works
 
 The design rests on one idea: **scan rarely, look up constantly.**

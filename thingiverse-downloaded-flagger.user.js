@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Thingiverse Downloaded Flagger
 // @namespace    https://github.com/nathanfwray/ThingiverseDownloadedFlagger
-// @version      0.2.0
-// @description  Flags Thingiverse things you've already downloaded by matching thing IDs against a local folder (File System Access API). Phase 1 skeleton.
+// @version      0.3.0
+// @description  Flags Thingiverse things you've already downloaded by matching thing IDs against a local folder (File System Access API). Scans in a Web Worker so the page never freezes.
 // @author       Nate
 // @match        https://www.thingiverse.com/*
 // @run-at       document-idle
@@ -20,11 +20,13 @@
   // ---------------------------------------------------------------------------
   const NS = 'tdf'; // namespace prefix for DOM/CSS/storage
   const DB_NAME = 'tdf-db';
-  const DB_VERSION = 1;
-  const STORE_KV = 'kv';          // directory handle + small blobs
-  const STORE_INDEX = 'idIndex';  // single record: { ids, builtAt, fileCount }
+  const DB_VERSION = 2;
+  const STORE_KV = 'kv';             // directory handle + small blobs
+  const STORE_INDEX = 'idIndex';     // single record: { ids, builtAt, fileCount }
+  const STORE_MANIFEST = 'manifest'; // single record: { entries:[{p,i:[ids]}], builtAt } — names-only, for phase 6
   const HANDLE_KEY = 'rootHandle';
   const INDEX_KEY = 'main';
+  const MANIFEST_KEY = 'main';
 
   const DEFAULT_SETTINGS = {
     enabled: true,
@@ -38,9 +40,11 @@
   // In-memory state for the current page.
   const state = {
     settings: loadSettings(),
-    ids: new Set(),     // Set<string> of downloaded thing IDs
-    indexMeta: null,    // { builtAt, fileCount }
+    ids: new Set(),       // Set<string> of downloaded thing IDs
+    indexMeta: null,      // { builtAt, fileCount }
     scanning: false,
+    worker: null,         // active scan Worker, if any
+    abortCurrent: null,   // settles the in-flight scan promise when cancelled
   };
 
   // ---------------------------------------------------------------------------
@@ -64,6 +68,7 @@
         const db = req.result;
         if (!db.objectStoreNames.contains(STORE_KV)) db.createObjectStore(STORE_KV);
         if (!db.objectStoreNames.contains(STORE_INDEX)) db.createObjectStore(STORE_INDEX);
+        if (!db.objectStoreNames.contains(STORE_MANIFEST)) db.createObjectStore(STORE_MANIFEST);
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
@@ -134,86 +139,194 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Scanner: recursive, NAME-ONLY walk (never opens files)
+  // Scanner: recursive, NAME-ONLY walk, run in a Web Worker (phase 5)
   // ---------------------------------------------------------------------------
-  function buildRegex() {
-    try {
-      return new RegExp(state.settings.filenamePattern, 'g');
-    } catch (e) {
-      console.warn('[TDF] invalid filename pattern, using default', e);
-      return new RegExp(DEFAULT_SETTINGS.filenamePattern, 'g');
+  // The recursive walk runs in a Blob-URL Worker so a large tree never freezes
+  // the page the user is browsing. The directory handle is structured-cloned
+  // into the worker; read permission is granted on the MAIN thread first
+  // (requestPermission needs a user gesture and is main-thread only). The worker
+  // reads entry.name only — it never calls getFile().
+  const WORKER_SRC = `
+    'use strict';
+    let aborted = false;
+
+    self.onmessage = (e) => {
+      const msg = e.data || {};
+      if (msg.type === 'abort') { aborted = true; return; }
+      if (msg.type === 'start') {
+        run(msg.rootHandle, msg.settings).catch((err) => {
+          self.postMessage({ type: 'error', message: String((err && err.message) || err) });
+        });
+      }
+    };
+
+    function buildRegex(pattern, fallback) {
+      try { return new RegExp(pattern, 'g'); }
+      catch (e) { return new RegExp(fallback, 'g'); }
     }
-  }
 
-  function extractIds(name, re, out) {
-    re.lastIndex = 0;
-    let m;
-    while ((m = re.exec(name)) !== null) {
-      if (m[1]) out.add(m[1]);
-      if (m.index === re.lastIndex) re.lastIndex++; // guard against zero-width
-    }
-  }
-
-  // Concurrency-bounded recursive walk. Reads entry.name only.
-  async function scanFolder(rootHandle, onProgress) {
-    const re = buildRegex();
-    const ids = new Set();
-    let fileCount = 0;
-
-    const limit = Math.max(1, state.settings.scanConcurrency | 0);
-    const queue = [rootHandle];
-    let active = 0;
-
-    async function walk(dirHandle) {
-      for await (const entry of dirHandle.values()) {
-        if (entry.kind === 'file') {
-          fileCount++;
-          extractIds(entry.name, re, ids);
-          if (fileCount % 500 === 0 && onProgress) {
-            onProgress({ fileCount, idCount: ids.size });
-          }
-        } else if (entry.kind === 'directory') {
-          if (state.settings.matchFolderNames) extractIds(entry.name, re, ids);
-          queue.push(entry);
-        }
+    function extractIds(name, re, out) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(name)) !== null) {
+        if (m[1]) out.push(m[1]);
+        if (m.index === re.lastIndex) re.lastIndex++; // guard against zero-width
       }
     }
 
-    // Simple worker pool over the queue.
-    await new Promise((resolve, reject) => {
-      const pump = () => {
-        if (queue.length === 0 && active === 0) return resolve();
-        while (active < limit && queue.length > 0) {
-          const dir = queue.shift();
-          active++;
-          walk(dir)
-            .catch(reject)
-            .finally(() => { active--; pump(); });
+    async function run(rootHandle, settings) {
+      const re = buildRegex(settings.filenamePattern, settings.fallbackPattern);
+      const ids = new Set();
+      const manifest = [];           // [{ p: path, i: [ids] }] — names only, for phase 6
+      let fileCount = 0;
+
+      const limit = Math.max(1, settings.scanConcurrency | 0);
+      const queue = [{ handle: rootHandle, path: '' }];
+      let active = 0;
+
+      async function walk(node) {
+        for await (const entry of node.handle.values()) {
+          if (aborted) return;
+          const path = node.path ? node.path + '/' + entry.name : entry.name;
+          if (entry.kind === 'file') {
+            fileCount++;
+            const found = [];
+            extractIds(entry.name, re, found);
+            if (found.length) {
+              for (const id of found) ids.add(id);
+              manifest.push({ p: path, i: found });
+            }
+            if (fileCount % 500 === 0) {
+              self.postMessage({ type: 'progress', fileCount, idCount: ids.size });
+            }
+          } else if (entry.kind === 'directory') {
+            if (settings.matchFolderNames) {
+              const found = [];
+              extractIds(entry.name, re, found);
+              for (const id of found) ids.add(id);
+            }
+            queue.push({ handle: entry, path });
+          }
+        }
+      }
+
+      // Bounded-concurrency work queue over the directory tree.
+      await new Promise((resolve, reject) => {
+        const pump = () => {
+          if (aborted) return resolve();
+          if (queue.length === 0 && active === 0) return resolve();
+          while (active < limit && queue.length > 0) {
+            const node = queue.shift();
+            active++;
+            walk(node).catch(reject).finally(() => { active--; pump(); });
+          }
+        };
+        pump();
+      });
+
+      if (aborted) { self.postMessage({ type: 'aborted', fileCount }); return; }
+      self.postMessage({ type: 'progress', fileCount, idCount: ids.size });
+      self.postMessage({ type: 'done', ids: Array.from(ids), fileCount, manifest });
+    }
+  `;
+
+  function spawnScanWorker() {
+    const blob = new Blob([WORKER_SRC], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    const worker = new Worker(url);
+    worker._objectURL = url; // revoked in cleanup
+    return worker;
+  }
+
+  // Run one scan in a worker. Resolves { ids:Set, fileCount, manifest, aborted }.
+  function scanInWorker(rootHandle, settings, onProgress) {
+    return new Promise((resolve, reject) => {
+      let worker;
+      try {
+        worker = spawnScanWorker();
+      } catch (e) {
+        reject(new Error('Could not start scan worker: ' + ((e && e.message) || e)));
+        return;
+      }
+      state.worker = worker;
+
+      const cleanup = () => {
+        try { URL.revokeObjectURL(worker._objectURL); } catch (e) { /* noop */ }
+        if (state.worker === worker) state.worker = null;
+        state.abortCurrent = null;
+      };
+
+      // Lets abortScan() settle this promise immediately on a hard terminate.
+      state.abortCurrent = () => {
+        try { worker.terminate(); } catch (e) { /* noop */ }
+        cleanup();
+        resolve({ ids: new Set(), fileCount: 0, manifest: [], aborted: true });
+      };
+
+      worker.onmessage = (e) => {
+        const m = e.data || {};
+        if (m.type === 'progress') {
+          if (onProgress) onProgress({ fileCount: m.fileCount, idCount: m.idCount });
+        } else if (m.type === 'aborted') {
+          worker.terminate(); cleanup();
+          resolve({ ids: new Set(), fileCount: m.fileCount, manifest: [], aborted: true });
+        } else if (m.type === 'done') {
+          worker.terminate(); cleanup();
+          resolve({ ids: new Set(m.ids), fileCount: m.fileCount, manifest: m.manifest, aborted: false });
+        } else if (m.type === 'error') {
+          worker.terminate(); cleanup();
+          reject(new Error(m.message || 'Scan worker error'));
         }
       };
-      pump();
-    });
+      worker.onerror = (e) => {
+        worker.terminate(); cleanup();
+        reject(new Error((e && e.message) || 'Scan worker failed to run'));
+      };
 
-    if (onProgress) onProgress({ fileCount, idCount: ids.size });
-    return { ids, fileCount };
+      worker.postMessage({
+        type: 'start',
+        rootHandle,
+        settings: {
+          filenamePattern: settings.filenamePattern,
+          fallbackPattern: DEFAULT_SETTINGS.filenamePattern,
+          matchFolderNames: settings.matchFolderNames,
+          scanConcurrency: settings.scanConcurrency,
+        },
+      });
+    });
+  }
+
+  // Cancel an in-flight scan (hard terminate; the existing index is left intact).
+  function abortScan() {
+    if (state.abortCurrent) {
+      state.abortCurrent();
+    } else if (state.worker) {
+      try { state.worker.terminate(); } catch (e) { /* noop */ }
+      state.worker = null;
+    }
   }
 
   async function runScan(onProgress) {
-    if (state.scanning) return;
+    if (state.scanning) return { aborted: true };
     state.scanning = true;
     try {
       const handle = await getStoredHandle();
-      if (!handle) { alert('Choose a folder first.'); return; }
+      if (!handle) { alert('Choose a folder first.'); return { aborted: true }; }
       const status = await checkPermission(handle, true);
-      if (status !== 'granted') { alert('Folder permission was not granted.'); return; }
+      if (status !== 'granted') { alert('Folder permission was not granted.'); return { aborted: true }; }
 
-      const { ids, fileCount } = await scanFolder(handle, onProgress);
-      const record = { ids: Array.from(ids), builtAt: Date.now(), fileCount };
+      const result = await scanInWorker(handle, state.settings, onProgress);
+      if (result.aborted) return result; // cancelled — keep the previous index
+
+      const builtAt = Date.now();
+      const record = { ids: Array.from(result.ids), builtAt, fileCount: result.fileCount };
       await idbPut(STORE_INDEX, INDEX_KEY, record);
+      await idbPut(STORE_MANIFEST, MANIFEST_KEY, { entries: result.manifest, builtAt });
 
-      state.ids = ids;
-      state.indexMeta = { builtAt: record.builtAt, fileCount };
+      state.ids = result.ids;
+      state.indexMeta = { builtAt, fileCount: result.fileCount };
       decoratePage(); // refresh badges with new data
+      return result;
     } finally {
       state.scanning = false;
     }
@@ -403,6 +516,7 @@
       <div id="${NS}-status" style="color:#555;margin-bottom:12px;">${escapeHtml(metaLine)}</div>
       <div style="display:flex;gap:8px;justify-content:flex-end;">
         <button id="${NS}-rescan" type="button">Rescan now</button>
+        <button id="${NS}-cancel" type="button" style="display:none;">Cancel</button>
         <button id="${NS}-save" type="button">Save</button>
         <button id="${NS}-close" type="button">Close</button>
       </div>`;
@@ -473,12 +587,34 @@
       // Persist current settings first so the scan uses them.
       applyFormToSettings($);
       status.textContent = 'Scanning…';
-      await runScan((p) => { status.textContent = `Scanning… ${p.fileCount} files, ${p.idCount} IDs`; });
+      $('rescan').disabled = true;
+      $('cancel').style.display = '';
+      let result;
+      try {
+        result = await runScan((p) => {
+          status.textContent = `Scanning… ${p.fileCount} files, ${p.idCount} IDs`;
+        });
+      } catch (e) {
+        status.textContent = 'Scan failed: ' + ((e && e.message) || e);
+        return;
+      } finally {
+        $('rescan').disabled = false;
+        $('cancel').style.display = 'none';
+      }
       refreshFolderStatus();
+      if (result && result.aborted) {
+        status.textContent = 'Scan cancelled — previous index kept.';
+        return;
+      }
       const m = state.indexMeta;
       status.textContent = m
         ? `Done: ${m.fileCount} files, ${state.ids.size} IDs (${new Date(m.builtAt).toLocaleString()})`
         : 'Scan finished.';
+    });
+
+    $('cancel').addEventListener('click', () => {
+      abortScan();
+      status.textContent = 'Cancelling…';
     });
 
     $('save').addEventListener('click', () => {
